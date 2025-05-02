@@ -1,2 +1,85 @@
-pip install streamlit pandas openpyxl requests beautifulsoup4 lxml
-streamlit run ok_red_live_coach_app.py
+# OK‑Red Meet Live‑Scoring & Line‑up Assistant – Streamlit app
+
+# ------------------------------------------------------------------------
+
+# Now computes *live conference seed ranks* automatically on each refresh.
+
+# No need to maintain a SeedRank column in the roster file.
+
+# ------------------------------------------------------------------------
+
+import streamlit as st import pandas as pd import numpy as np import requests from bs4 import BeautifulSoup from io import StringIO
+
+# ----------------------------- Config ------------------------------------
+
+POINTS\_TABLE = {1: 10, 2: 8, 3: 6, 4: 5, 5: 4, 6: 3, 7: 2, 8: 1} MAX\_EVENTS\_PER\_ATHLETE = 4 GH\_SCHOOL = "Grand Haven" MEET\_URL = "[https://www.athletic.net/TrackAndField/meet/572993/results](https://www.athletic.net/TrackAndField/meet/572993/results)"
+
+st.set\_page\_config(page\_title="OK‑Red Coach Dashboard", layout="centered", page\_icon="🏆")
+
+# ----------------------------- Helpers -----------------------------------
+
+@st.cache\_data(show\_spinner=False) def read\_sheet(f): if f.name.endswith(".csv"): return pd.read\_csv(f) return pd.read\_excel(f)
+
+@st.cache\_data(show\_spinner=False) def scrape\_athletic\_results(url: str) -> pd.DataFrame: """Scrape Athletic.net finals tables -> Event | Place | School.""" r = requests.get(url, timeout=15) r.raise\_for\_status() soup = BeautifulSoup(r.text, "lxml") rows = [] for blk in soup.select("div.event-results"): ev = blk.select\_one("h4").get\_text(strip=True) table = blk.select\_one("table") if not table or "No Results" in table.text: continue df = pd.read\_html(StringIO(str(table)))[0] for \_, rw in df.iterrows(): try: plc = int(rw\.get("Place", rw\.iloc[0])) except ValueError: continue if plc > 8: break school = rw\.get("Team", rw\.iloc[3]) rows.append({"Event": ev, "Place": plc, "School": school}) return pd.DataFrame(rows)
+
+# Determine if event is field (higher mark better) or track (lower time better)
+
+FIELD\_KEYWORDS = ["Jump", "Long", "High", "Vault", "Shot", "Discus", "Pole", "Javelin"]
+
+def ascending\_order(event\_name: str) -> bool: return not any(k.lower() in event\_name.lower() for k in FIELD\_KEYWORDS)
+
+# ----------------------------- UI ----------------------------------------
+
+st.title("🏆 OK‑Red Championship – Live Coach Dashboard")
+
+st.sidebar.header("🔧 Upload meet data") roster\_file = st.sidebar.file\_uploader("Roster & season‑best marks (xlsx/csv)") lineup\_file = st.sidebar.file\_uploader("Initial lineup (xlsx/csv)")
+
+fetch = st.sidebar.button("🌐 Fetch latest Athletic.net results") refresh = st.sidebar.button("🔄 Refresh dashboard")
+
+# -------------------------------------------------------------------------
+
+if not (roster\_file and lineup\_file): st.info("Upload roster and lineup to begin.") st.stop()
+
+roster = read\_sheet(roster\_file) lineup = read\_sheet(lineup\_file) results = pd.DataFrame()
+
+if fetch or refresh: with st.spinner("Scraping Athletic.net …"): try: results = scrape\_athletic\_results(MEET\_URL) st.success(f"Fetched {len(results)} rows.") except Exception as e: st.error(f"Scrape failed: {e}") results = pd.DataFrame(columns=["Event", "Place", "School"])
+
+# If no results yet, keep an empty DF for downstream calc
+
+if results.empty: results = pd.DataFrame(columns=["Event", "Place", "School"])
+
+# ---------------------- Compute conference ranks -------------------------
+
+roster = roster.copy() roster["ConfRank"] = np.nan  # placeholder for ev, grp in roster.groupby("Event"): asc = ascending\_order(ev) grp\_sorted = grp.sort\_values("Mark", ascending=asc).reset\_index() roster.loc[grp\_sorted["index"], "ConfRank"] = grp\_sorted.index + 1
+
+# ---------------------- Live scoreboard ----------------------------------
+
+pts\_live = results.copy() pts\_live["Points"] = pts\_live["Place"].map(POINTS\_TABLE) team\_pts = pts\_live.groupby("School")["Points"].sum().reset\_index().sort\_values("Points", ascending=False)
+
+st.subheader("Live team scores (scored events only)") st.dataframe(team\_pts, use\_container\_width=True, height=300)
+
+# ---------------------- Remaining events & GH projection ------------------
+
+scored = set(results["Event"].unique()) remaining = [ev for ev in lineup["Event"].unique() if ev not in scored] proj\_rows = [] for ev in remaining: ev\_roster = roster[roster["Event"] == ev].sort\_values("ConfRank")[:8] ev\_roster["ProjPts"] = ev\_roster["ConfRank"].map(POINTS\_TABLE) gh\_pts = ev\_roster.loc[ev\_roster["School"] == GH\_SCHOOL, "ProjPts"].sum() proj\_rows.append({"Event": ev, "GH\_expected": gh\_pts}) proj\_df = pd.DataFrame(proj\_rows).sort\_values("Event")
+
+st.subheader("Remaining events – Grand Haven projected points") st.dataframe(proj\_df, use\_container\_width=True, height=300)
+
+# ---------------------- Greedy swap suggestions --------------------------
+
+ath\_load = lineup.groupby("Athlete").size().to\_dict() swaps = [] for ev in remaining: gh\_candidates = roster[(roster["Event"] == ev) & (roster["School"] == GH\_SCHOOL)] if gh\_candidates.empty: continue # current GH points in event current\_entries = lineup[(lineup["Event"] == ev) & (lineup["School"] == GH\_SCHOOL)]["Athlete"] cur\_pts = roster[(roster["Event"] == ev) & (roster["Athlete"].isin(current\_entries))]["ConfRank"].map(POINTS\_TABLE).sum()
+
+```
+for _, cand in gh_candidates.iterrows():
+    ath = cand["Athlete"]
+    if ath_load.get(ath, 0) >= MAX_EVENTS_PER_ATHLETE:
+        continue
+    pot_pts = POINTS_TABLE.get(int(cand["ConfRank"]), 0)
+    if pot_pts - cur_pts >= 2:
+        swaps.append({"Event": ev, "SwapIn": ath, "Potential": pot_pts, "Current": cur_pts, "Delta": pot_pts - cur_pts})
+        break
+```
+
+st.subheader("💡 Suggested GH swaps (≥ 2‑pt gain)") if swaps: st.dataframe(pd.DataFrame(swaps), use\_container\_width=True) else: st.info("No high‑impact swaps found.")
+
+st.caption("App refresh computes live conference ranks from raw marks—no SeedRank column needed 👍")
+
